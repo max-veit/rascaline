@@ -1,4 +1,4 @@
-use rascaline::{Calculator, Descriptor, System};
+use rascaline::{Calculator, Descriptor, System, descriptor::DotOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // load the systems from command line argument
@@ -30,14 +30,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut descriptor = Descriptor::new();
 
     // run the calculation using default options
-    calculator.compute(&mut systems, &mut descriptor, Default::default())?;
+    calculator.compute(&mut systems[..10], &mut descriptor, Default::default())?;
 
     // Transform the descriptor to dense representation,
     // with one sample for each atom-centered environment.
-    descriptor.densify(&["species_neighbor_1", "species_neighbor_2"], None)?;
+    // descriptor.densify(&["species_neighbor_1", "species_neighbor_2"], None)?;
 
     // you can now use descriptor.values as the
     // input of a machine learning algorithm
+
+    // create an empty descriptor
+    let mut descriptor_sparse = Descriptor::new();
+
+    // run the calculation using default options
+    calculator.compute(&mut systems[10..12], &mut descriptor_sparse, Default::default())?;
+
+    // Transform the descriptor to dense representation,
+    // with one sample for each atom-centered environment.
+    // descriptor.densify(&["species_neighbor_1", "species_neighbor_2"], None)?;
+
+    let kernel = descriptor.dot(&descriptor_sparse, DotOptions {
+        reduce_across: &["species_neighbor_1", "species_neighbor_2"],
+        gradients: true,
+        normalize: true
+    });
 
     Ok(())
 }

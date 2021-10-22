@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import numpy as np
-from ctypes import c_double, c_int32, c_char_p, POINTER, ARRAY
+from ctypes import c_double, c_int32, c_char_p, c_bool
+from ctypes import POINTER, ARRAY
 
 from ._rascaline import c_uintptr_t, rascal_indexes
 from .clib import _get_library
@@ -243,6 +244,31 @@ class Descriptor:
         self._lib.rascal_descriptor_densify(
             self, c_variables, c_variables._length_, requested, requested_size
         )
+
+    def dot(self, other, reduce_across=(), gradients=False, normalize=False):
+        """
+        TODO: documentation
+        """
+        if isinstance(reduce_across, str):
+            reduce_across = [reduce_across]
+
+        output = Descriptor()
+
+        c_reduce_across = ARRAY(c_char_p, len(reduce_across))()
+        for i, variable in enumerate(reduce_across):
+            c_reduce_across[i] = variable.encode("utf8")
+
+        self._lib.rascal_descriptor_dot(
+            self,
+            other,
+            output,
+            c_reduce_across,
+            c_reduce_across._length_,
+            c_bool(gradients),
+            c_bool(normalize),
+        )
+
+        return output
 
 
 def _ptr_to_ndarray(ptr, shape):

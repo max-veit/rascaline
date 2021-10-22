@@ -49,7 +49,7 @@ fn compute_soap(path: &str) -> Result<Descriptor, Box<dyn std::error::Error>> {
     let mut calculator = Calculator::new("soap_power_spectrum", parameters.to_owned())?;
     let mut descriptor = Descriptor::new();
     calculator.compute(&mut systems, &mut descriptor, Default::default())?;
-    descriptor.densify(&["species_neighbor_1", "species_neighbor_2"], None)?;
+    // descriptor.densify(&["species_neighbor_1", "species_neighbor_2"], None)?;
 
     Ok(descriptor)
 }

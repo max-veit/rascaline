@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
-use indexmap::set::IndexSet;
 
+use indexmap::set::IndexSet;
 use itertools::Itertools;
-use ndarray::{Array2, ArrayView2, s};
+use ndarray::{Array1, Array2, ArrayView2, s};
+
+use rayon::prelude::*;
 
 use log::warn;
 
@@ -276,6 +278,356 @@ impl Descriptor {
 
         return Ok(());
     }
+
+    /// Compute the dot product between `self` and `other`, giving the resulting
+    /// matrix in the `values` array of a new descriptor.
+    ///
+    /// The resulting dot product can then be used to compute kernels matrix,
+    /// and gradients of these kernel matrix.
+    ///
+    /// The dot product is computed as if the user called
+    /// `densify(reduce_across)` before, i.e.
+    ///
+    /// ```
+    /// let dot = descriptor.dot(&other, &["variable"], (False, False));
+    /// // is equivalent to
+    /// descriptor.densify(&["variable"]);
+    /// other.densify(&["variable"]);
+    /// dot.values = descriptor.values.dot(other.values.t());
+    /// ```
+    ///
+    /// The `gradients` parameter controls whether we are computing the dot
+    /// product between values/gradient on the left hand side and
+    /// values/gradients on the right hand side.
+    ///
+    /// ```
+    /// // values / values dot product
+    /// let dot = descriptor.dot(&other, &[], (False, False));
+    /// // is equivalent to
+    /// dot.values = descriptor.values.dot(other.values.t());
+    ///
+    /// // gradients / values dot product
+    /// let dot = descriptor.dot(&other, &[], (True, False));
+    /// // is equivalent to
+    /// dot.values = descriptor.gradients.dot(other.values.t());
+    ///
+    /// // gradients / gradients dot product
+    /// let dot = descriptor.dot(&other, &[], (True, True));
+    /// // is equivalent to
+    /// dot.values = descriptor.gradients.dot(other.gradients.t());
+    /// ```
+    #[time_graph::instrument]
+    pub fn dot(
+        &self,
+        other: &Descriptor,
+        options: DotOptions,
+    ) -> Result<Descriptor, Error> {
+        if self.features != other.features {
+            return Err(Error::InvalidParameter(
+                "descriptors have different features, the dot product between \
+                them is not well defined".into()
+            ));
+        }
+
+        for variable in options.reduce_across {
+            if !self.samples.names().contains(variable) {
+                return Err(Error::InvalidParameter(format!(
+                    "'{}' does not appear on the left hand side samples for \
+                    this dot product", variable
+                )));
+            }
+
+            if !other.samples.names().contains(variable) {
+                return Err(Error::InvalidParameter(format!(
+                    "'{}' does not appear on the right hand side samples for \
+                    this dot product", variable
+                )));
+            }
+        }
+
+        let rhs = &other.values;
+        let rhs_samples = &other.samples;
+
+        let removed_rhs = remove_from_samples(rhs_samples, options.reduce_across)?;
+        let removed_lhs = remove_from_samples(&self.samples, options.reduce_across)?;
+        let removed_grad = if options.gradients {
+            let gradients_samples = self.gradients_samples.as_ref().ok_or_else(
+                || Error::InvalidParameter(
+                    "the left hand side descriptor does not contain gradient data, \
+                    but the dot product requested it".into()
+                )
+            )?;
+
+            Some(remove_from_samples(gradients_samples, options.reduce_across)?)
+        } else {
+            None
+        };
+
+        let mut output = Descriptor::new();
+        if let Some(ref removed_grad) = removed_grad {
+            output.prepare_gradients(removed_lhs.samples, removed_grad.samples.clone(), removed_rhs.samples);
+        } else {
+            output.prepare(removed_lhs.samples, removed_rhs.samples);
+        }
+
+        // transform from a DensifiedIndex identifying the new features as a
+        // `Vec<IndexValue>` to a tuple identifying the new feature with a
+        // single numeric id. This speeds up the double loop below by making the
+        // `if feature_lhs != feature_rhs` comparison much faster.
+        let mut features = std::collections::BTreeMap::new();
+        let mut build_features_id = |mapping: Vec<DensifiedIndex>| {
+            return mapping.into_iter().map(|densified| {
+                let next_id = features.len();
+                let feature_id = *features.entry(densified.variables).or_insert(next_id);
+
+                return (densified.new_sample_i, densified.old_sample_i, feature_id);
+            }).collect::<Vec<_>>();
+        };
+
+        #[derive(Clone)]
+        struct DotIndexesPerRow {
+            old_lhs: usize,
+            rhs_indexes: Vec<(usize, usize)>,
+        }
+
+
+        let compute_dot_products_indexes = |lhs, rhs, n_rows| {
+            let mut rows = Array1::from_elem(n_rows, Vec::new());
+
+            for &(new_lhs, old_lhs, feature_lhs) in lhs {
+                let mut rhs_indexes = Vec::new();
+                for &(new_rhs, old_rhs, feature_rhs) in rhs {
+                    // ensure that we are considering matching set of values from
+                    // reduce_across (e.g. only consider dot product between
+                    // matching `neighbor_species_1 / neighbor_species_2` values)
+                    if feature_lhs != feature_rhs {
+                        continue;
+                    }
+
+                    rhs_indexes.push((old_rhs, new_rhs));
+                }
+                rows[new_lhs].push(DotIndexesPerRow { old_lhs, rhs_indexes });
+            }
+            return rows;
+        };
+
+        let lhs_mapping = &build_features_id(removed_lhs.mapping);
+        let rhs_mapping = &build_features_id(removed_rhs.mapping);
+
+
+        // let n_cols = output.features.count();
+        // let n_rows = output.samples.count();
+        // let output_values = &mut output.values;
+
+        let indexes = compute_dot_products_indexes(
+            lhs_mapping, rhs_mapping, output.values.nrows()
+        );
+        ndarray::Zip::from(output.values.rows_mut())
+            .and(&indexes)
+            .par_for_each(|mut row, row_indexes| {
+                for index in row_indexes {
+                    let lhs_slice = self.values.slice(s![index.old_lhs, ..]);
+                    for &(old_rhs, new_rhs) in &index.rhs_indexes {
+                        let rhs_slice = rhs.slice(s![old_rhs, ..]);
+                        row[new_rhs] += lhs_slice.dot(&rhs_slice);
+                    }
+                }
+            });
+
+
+        // let (sender, receiver) = crossbeam::channel::bounded(2 * rayon::current_num_threads());
+        // crossbeam::thread::scope(|s| {
+        //     s.spawn(move |_| {
+        //         lhs_mapping.par_iter()
+        //             .for_each(|&(new_lhs, old_lhs, feature_lhs)| {
+        //                 let mut row = Array1::from_elem(n_cols, 0.0);
+        //                 for &(new_rhs, old_rhs, feature_rhs) in rhs_mapping {
+        //                     // ensure that we are considering matching set of
+        //                     // values from reduce_across (e.g. only consider dot
+        //                     // product between matching `neighbor_species_1 /
+        //                     // neighbor_species_2` values)
+        //                     if feature_lhs != feature_rhs {
+        //                         continue;
+        //                     }
+
+        //                     let lhs_slice = self.values.slice(s![old_lhs, ..]);
+        //                     let rhs_slice = rhs.slice(s![old_rhs, ..]);
+
+        //                     row[new_rhs] += lhs_slice.dot(&rhs_slice);
+        //                 }
+
+        //                 sender.send((new_lhs, row)).expect("failed to send data");
+        //             });
+        //     });
+
+        //     s.spawn(move |_| {
+        //         for (i, values) in receiver {
+        //             let mut row = output_values.slice_mut(s![i, ..]);
+        //             row += &values;
+        //         }
+        //     });
+        // }).expect("one of the thread panicked");
+
+
+        // for &(new_lhs, old_lhs, feature_lhs) in &lhs_mapping {
+        //     for &(new_rhs, old_rhs, feature_rhs) in &rhs_mapping {
+        //         // ensure that we are considering matching set of values from
+        //         // reduce_across (e.g. only consider dot product between
+        //         // matching `neighbor_species_1/neighbor_species_2` values)
+        //         if feature_lhs != feature_rhs {
+        //             continue;
+        //         }
+
+        //         let lhs_slice = self.values.slice(s![old_lhs, ..]);
+        //         let rhs_slice = rhs.slice(s![old_rhs, ..]);
+
+        //         output.values[[new_lhs, new_rhs]] += lhs_slice.dot(&rhs_slice);
+
+        //     }
+        // }
+
+
+        if let Some(removed_grad) = removed_grad {
+            let gradient_mapping = &build_features_id(removed_grad.mapping);
+            let output_gradients = output.gradients.as_mut().expect("missing gradient storage in output");
+            let self_gradients = self.gradients.as_ref().expect("missing gradient data");
+
+            let indexes = compute_dot_products_indexes(
+                gradient_mapping, rhs_mapping, output_gradients.nrows()
+            );
+
+            ndarray::Zip::from(output_gradients.rows_mut())
+                .and(&indexes)
+                .par_for_each(|mut row, row_indexes| {
+                    for index in row_indexes {
+                        let lhs_slice = self_gradients.slice(s![index.old_lhs, ..]);
+                        for &(old_rhs, new_rhs) in &index.rhs_indexes {
+                            let rhs_slice = rhs.slice(s![old_rhs, ..]);
+                            row[new_rhs] += lhs_slice.dot(&rhs_slice);
+                        }
+                    }
+                });
+
+            // let (sender, receiver) = crossbeam::channel::bounded(2 * rayon::current_num_threads());
+            // crossbeam::thread::scope(|s| {
+            //     s.spawn(move |_| {
+            //         compute_dot_products_indexes(gradient_mapping, rhs_mapping)
+            //             .par_iter()
+            //             .for_each(|indexes| {
+            //                 let lhs_slice = self_gradients.slice(s![indexes.old_lhs, ..]);
+            //                 let rhs_slice = rhs.slice(s![indexes.old_rhs, ..]);
+
+            //                 let dot = lhs_slice.dot(&rhs_slice);
+            //                 sender.send((indexes.new, dot)).expect("failed to send data");
+            //             });
+            //     });
+
+            //     s.spawn(move |_| {
+            //         for ([i, j], value) in receiver {
+            //             output_gradients[[i, j]] += value;
+            //         }
+            //     });
+            // }).expect("one of the thread panicked");
+
+            // crossbeam::thread::scope(|s| {
+            //     s.spawn(move |_| {
+            //         gradient_mapping.par_iter()
+            //         .for_each(|&(new_lhs, old_lhs, feature_lhs)| {
+            //             let mut row = Array1::from_elem(n_cols, 0.0);
+            //             for &(new_rhs, old_rhs, feature_rhs) in rhs_mapping {
+            //                 if feature_lhs != feature_rhs {
+            //                     continue;
+            //                 }
+
+            //                 let lhs_slice = self_gradients.slice(s![old_lhs, ..]);
+            //                 let rhs_slice = rhs.slice(s![old_rhs, ..]);
+
+            //                 row[new_rhs] += lhs_slice.dot(&rhs_slice);
+            //             }
+
+            //             sender.send((new_lhs, row)).expect("failed to send data");
+            //         });
+            //     });
+
+            //     s.spawn(move |_| {
+            //         for (i, values) in receiver {
+            //             let mut row = output_gradients.slice_mut(s![i, ..]);
+            //             row += &values;
+            //         }
+            //     });
+            // }).expect("one of the thread panicked");
+
+
+            // for &(new_lhs, old_lhs, feature_lhs) in &grad_mapping {
+            //     for &(new_rhs, old_rhs, feature_rhs) in rhs_mapping {
+            //         if feature_lhs != feature_rhs {
+            //             continue;
+            //         }
+
+            //         let lhs_slice = self_gradients.slice(s![old_lhs, ..]);
+            //         let rhs_slice = rhs.slice(s![old_rhs, ..]);
+
+            //         output_gradients[[new_lhs, new_rhs]] += lhs_slice.dot(&rhs_slice);
+            //     }
+            // }
+        }
+
+
+        // let mut lhs = self.clone();
+        // let mut rhs = other.clone();
+
+        // lhs.densify(options.reduce_across, None)?;
+        // rhs.densify(options.reduce_across, None)?;
+
+        // let mut output = Descriptor::new();
+        // if options.gradients {
+        //     output.prepare_gradients(lhs.samples, lhs.gradients_samples.unwrap(), rhs.samples);
+        // } else {
+        //     output.prepare(lhs.samples, rhs.samples);
+        // }
+
+        // output.values = lhs.values.dot(&rhs.values.t());
+        // if options.gradients {
+        //     let output_gradients = output.gradients.as_mut().expect("missing gradient storage in output");
+        //     *output_gradients = lhs.gradients.unwrap().dot(&rhs.values.t());
+        // }
+
+
+        if options.normalize {
+            let norm_lhs = compute_norm(&self.values, output.values.shape()[0], lhs_mapping);
+            let norm_rhs = compute_norm(rhs, output.values.shape()[1], rhs_mapping);
+
+            output.values.indexed_iter_mut().for_each(|((i, j), value)| {
+                *value /= norm_lhs[i] * norm_rhs[j];
+            });
+
+            if let Some(ref mut gradients) = output.gradients {
+                let gradients_samples = output.gradients_samples.as_ref().expect("missing gradient storage");
+
+                // we assume the final two gradient samples variables are
+                // atom/neighbor and then spatial
+                let gradient_samples_size = gradients_samples.size();
+                assert_eq!(gradient_samples_size, output.samples.size() + 2);
+                assert_eq!(gradients_samples.names()[gradient_samples_size - 1], "spatial");
+
+                let mut norm_grad = Array1::from_elem(gradients_samples.count(), 0.0);
+                for (i_gradient, gradient_sample) in gradients_samples.iter().enumerate() {
+                    let sample = &gradient_sample[..(gradient_samples_size - 2)];
+                    let i_value = output.samples.position(sample)
+                        .expect("this gradient sample does not correspond to a value sample");
+
+                    norm_grad[i_gradient] = norm_lhs[i_value];
+                }
+
+                gradients.indexed_iter_mut().for_each(|((i, j), value)| {
+                    *value /= norm_grad[i] * norm_rhs[j];
+                });
+
+            }
+        }
+
+        return Ok(output);
+    }
 }
 
 fn resize_and_reset(array: &mut Array2<f64>, shape: (usize, usize)) {
@@ -379,6 +731,54 @@ fn remove_from_samples(samples: &Indexes, variables: &[&str]) -> Result<RemovedS
         new_features: new_features,
         mapping: mapping,
     });
+}
+
+/// Compute the 2-norm of each row in the values array using the provided
+/// mapping. This is a helper function for `Descriptor::dot`
+fn compute_norm(values: &Array2<f64>, size: usize, mapping: &[(usize, usize, usize)]) -> Array1<f64> {
+    let mut output = Array1::from_elem(size, 0.0);
+
+    for &(new_lhs, old_lhs, feature_lhs) in mapping {
+        for &(new_rhs, old_rhs, feature_rhs) in mapping {
+            // only consider values on the diagonal
+            if new_lhs != new_rhs {
+                continue;
+            }
+
+            // ensure that we are considering matching set of values from
+            // reduce_across (e.g. only consider dot product between
+            // matching `neighbor_species_1/neighbor_species_2` values)
+            if feature_lhs != feature_rhs {
+                continue;
+            }
+
+            let lhs_slice = values.slice(s![old_lhs, ..]);
+            let rhs_slice = values.slice(s![old_rhs, ..]);
+
+            output[new_lhs] += lhs_slice.dot(&rhs_slice);
+        }
+    }
+
+    output.iter_mut().for_each(|v| *v = f64::sqrt(*v));
+
+    return output;
+}
+
+#[derive(Debug, Clone)]
+pub struct DotOptions<'a> {
+    pub reduce_across: &'a [&'a str],
+    pub normalize: bool,
+    pub gradients: bool,
+}
+
+impl<'a> Default for DotOptions<'a> {
+    fn default() -> DotOptions<'a> {
+        DotOptions {
+            reduce_across: &[],
+            normalize: false,
+            gradients: false,
+        }
+    }
 }
 
 

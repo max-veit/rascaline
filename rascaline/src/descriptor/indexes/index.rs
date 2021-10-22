@@ -7,7 +7,7 @@ use twox_hash::XxHash64;
 use crate::{Error, System};
 
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct IndexValue(i32);
 
 impl std::fmt::Debug for IndexValue {

@@ -719,12 +719,13 @@ impl CalculatorBase for SphericalExpansion {
 
             // use crossbeam channels instead of std::sync::mpsc::SyncChannel
             // since crossbeam is faster in our case.
-            let (sender_values, receiver_values) = crossbeam::channel::unbounded::<PairContribution>();
-            let (sender_grad, receiver_grad) = crossbeam::channel::unbounded::<GradientsPairContribution>();
+            let channel_size = rayon::current_num_threads();
+            let (sender_values, receiver_values) = crossbeam::channel::bounded::<PairContribution>(channel_size);
+            let (sender_grad, receiver_grad) = crossbeam::channel::bounded::<GradientsPairContribution>(channel_size);
 
             // use crossbeam scoped threads instead of rayon's, to ensure we
             // make progress even with RAYON_NUM_THREADS=1
-            crossbeam::thread::scope(|s|{
+            crossbeam::thread::scope(|s| {
                 // re-borrow self as an immutable reference to be passed to
                 // the first closure below
                 let this = &*self;

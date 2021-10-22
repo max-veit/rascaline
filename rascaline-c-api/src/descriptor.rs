@@ -2,7 +2,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::raw::c_char;
 use std::ffi::CStr;
 
-use rascaline::descriptor::{Descriptor, IndexValue};
+use rascaline::descriptor::{Descriptor, IndexValue, DotOptions};
 use rascaline::Error;
 use super::{catch_unwind, rascal_status_t};
 
@@ -382,7 +382,38 @@ pub unsafe extern fn rascal_descriptor_densify(
             ))
         };
 
-        (*descriptor).densify(&rust_variables, requested)?;
+        return (*descriptor).densify(&rust_variables, requested);
+    })
+}
+
+/// TODO: documentation
+#[no_mangle]
+pub unsafe extern fn rascal_descriptor_dot(
+    lhs: *const rascal_descriptor_t,
+    rhs: *const rascal_descriptor_t,
+    output: *mut rascal_descriptor_t,
+    reduce_across: *const *const c_char,
+    reduce_across_count: usize,
+    gradients: bool,
+    normalize: bool,
+) -> rascal_status_t {
+    catch_unwind(|| {
+        check_pointers!(lhs, rhs, output, reduce_across);
+
+        let mut rust_reduce_across = Vec::new();
+        for &variable in std::slice::from_raw_parts(reduce_across, reduce_across_count) {
+            check_pointers!(variable);
+            let variable = CStr::from_ptr(variable).to_str()?;
+            rust_reduce_across.push(variable);
+        }
+
+        let options = DotOptions {
+            reduce_across: &rust_reduce_across,
+            gradients: gradients,
+            normalize: normalize,
+        };
+
+        (*output).0 = (*lhs).dot(&*rhs, options)?;
 
         Ok(())
     })

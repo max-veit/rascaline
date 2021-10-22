@@ -9,3 +9,4 @@ pub use self::indexes::{ThreeBodiesSpeciesSamples};
 #[allow(clippy::module_inception)]
 mod descriptor;
 pub use self::descriptor::Descriptor;
+pub use self::descriptor::DotOptions;

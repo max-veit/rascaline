@@ -550,6 +550,17 @@ rascal_status_t rascal_descriptor_densify(struct rascal_descriptor_t *descriptor
                                           uintptr_t requested_size);
 
 /**
+ * TODO: documentation
+ */
+rascal_status_t rascal_descriptor_dot(const struct rascal_descriptor_t *lhs,
+                                      const struct rascal_descriptor_t *rhs,
+                                      struct rascal_descriptor_t *output,
+                                      const char *const *reduce_across,
+                                      uintptr_t reduce_across_count,
+                                      bool gradients,
+                                      bool normalize);
+
+/**
  * Create a new calculator with the given `name` and `parameters`.
  *
  * @verbatim embed:rst:leading-asterisk
