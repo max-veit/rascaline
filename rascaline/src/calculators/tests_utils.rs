@@ -20,7 +20,6 @@ pub fn compute_partial(
     systems: &mut [Box<dyn System>],
     samples: Indexes,
     features: Indexes,
-    gradients: bool,
 ) {
     let mut full = Descriptor::new();
     calculator.compute(systems, &mut full, Default::default()).unwrap();
@@ -42,7 +41,7 @@ pub fn compute_partial(
             partial.values.slice(s![.., partial_i])
         );
 
-        if gradients {
+        if calculator.gradients() {
             assert_ulps_eq!(
                 full.gradients.as_ref().unwrap().slice(s![.., index]),
                 partial.gradients.as_ref().unwrap().slice(s![.., partial_i])
@@ -67,7 +66,7 @@ pub fn compute_partial(
         );
     }
 
-    if gradients {
+    if calculator.gradients() {
         for (partial_i, sample) in partial.gradients_samples.as_ref().unwrap().iter().enumerate() {
             let index = full.gradients_samples.as_ref().unwrap().position(sample).unwrap();
             assert_ulps_eq!(
@@ -95,7 +94,7 @@ pub fn compute_partial(
         }
     }
 
-    if gradients {
+    if calculator.gradients() {
         for (sample_i, sample) in partial.gradients_samples.as_ref().unwrap().iter().enumerate() {
             for (feature_i, feature) in features.iter().enumerate() {
                 let full_sample_i = full.gradients_samples.as_ref().unwrap().position(sample).unwrap();
