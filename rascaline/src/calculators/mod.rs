@@ -79,3 +79,4 @@ pub use self::dummy_calculator::DummyCalculator;
 pub mod soap;
 pub use self::soap::{SphericalExpansion, SphericalExpansionParameters};
 pub use self::soap::{SoapPowerSpectrum, PowerSpectrumParameters};
+pub use self::soap::{RadialSpectrum, RadialSpectrumParameters};

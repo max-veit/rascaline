@@ -11,5 +11,8 @@ mod spherical_expansion;
 pub use self::spherical_expansion::{SphericalExpansion, SphericalExpansionParameters};
 pub use self::spherical_expansion::{RadialBasis, CutoffFunction};
 
+mod radial_spectrum;
+pub use self::radial_spectrum::{RadialSpectrum, RadialSpectrumParameters};
+
 mod power_spectrum;
 pub use self::power_spectrum::{SoapPowerSpectrum, PowerSpectrumParameters};
